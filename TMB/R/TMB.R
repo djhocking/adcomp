@@ -551,10 +551,13 @@ MakeADFun <- function(data,parameters,map=list(),
   ##   are zero wrt. the fixed effects.
   MC <- function(par=last.par,       ## Point in which we are evaluating the likelihood
                  par0=last.par.best, ## Parameter for proposal distribution
-                 n=100,order=0,seed=NULL,antithetic=TRUE,
-                 output=c("value","points"),...){
+                 n=100,              ## Number of samples
+                 order=0,            ## Derivative order
+                 seed=NULL,          ## Random seed
+                 antithetic=TRUE,    ## Reduce variance
+                 keep=FALSE,         ## Keep samples and fct evals
+                 ...){
     if(is.numeric(seed))set.seed(seed)
-    output <- match.arg(output)
     ## Clean up on exit
     last.par.old <- last.par
     last.par.best.old <- last.par.best
@@ -597,10 +600,14 @@ MakeADFun <- function(data,parameters,map=list(),
       ## h <- colMeans(vec*(-I1I1+I2))/mean(vec)+as.vector(gr)%*%t(as.vector(gr))
       ## if(order==2)return(h)
     }
-    switch(output,
-           "value"=-log(mean(exp(I-M)))-M,
-           "points"=list(samples=samples,f=I+log.density.propose,w=exp(I-M),
-             keep=as.logical(rbinom(n,size=1,prob=exp(I-M)))))
+    value <- -log(mean(exp(I-M)))-M
+    ci <- 1.96*sd(exp(I-M))/sqrt(n)
+    attr(value,"confint") <- -log(mean(exp(I-M))+c(lower=ci,upper=-ci))-M
+    if(keep){
+        attr(value,"samples") <- samples
+        attr(value,"nlratio") <- -I
+    }
+    value
   }
 
   report <- function(par=last.par){
