@@ -518,7 +518,26 @@ public:
     if(reversefill)theta[index++]=x;else x=theta[index++];
   }
    
-   Type operator() ();
+  Type operator() ();
+
+  Type evalUserTemplate(){
+    Type ans=this->operator()();
+    /* After evaluating the template, "index" should be equal to the length of "theta".
+       If not, we assume that the "epsilon method" has been requested from R, I.e.
+       that the un-used theta parameters are reserved for an inner product contribution
+       with the numbers reported via ADREPORT. */
+    if(index!=theta.size()){
+      if( index + reportvector.size() != theta.size() )
+	error("evalUserTemplate: Invalid parameter length.");
+      if( reportvector.size() > 0 ){
+	vector<Type> epsilon(reportvector.size());
+	this->fill(epsilon,"epsilon"); /* Assume theta has been sufficiently augmented */
+	ans += ( this->reportvector.result * epsilon ).sum();
+      }
+    }
+    return ans;
+  }
+
 }; // objective_function
 
 /* Experiment: Help manage the parallel accumulation.
@@ -696,7 +715,7 @@ ADFun<double>* MakeADFunObject(SEXP data, SEXP parameters,
   ADFun< double >* pf;
   if(!returnReport){ // Default case: no ad report - parallel run allowed
     vector< AD<double> > y(1);
-    y[0]=F();
+    y[0]=F.evalUserTemplate();
     pf = new ADFun< double >(F.theta,y);
   } else { // ad report case
     F(); // Run through user template (modifies reportvector)
@@ -918,7 +937,7 @@ ADFun< double >* MakeADGradObject(SEXP data, SEXP parameters, SEXP report, int p
   int n=F.theta.size();
   Independent(F.theta);
   vector< AD<AD<double> > > y(1);
-  y[0]=F();
+  y[0]=F.evalUserTemplate();
   ADFun<AD<double> > tmp(F.theta,y);
   vector<AD<double> > x(n);
   for(int i=0;i<n;i++)x[i]=CppAD::Value(F.theta[i]);
@@ -1084,7 +1103,7 @@ sphess MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP skip, int
 
   Independent(F.theta);
   vector< AD<AD<AD<double> > > > y(1);
-  y[0]=F();
+  y[0]=F.evalUserTemplate();
   ADFun<AD<AD<double> > > tmp(F.theta,y);
 
   /* Tape gradient R^n -> R^n */
