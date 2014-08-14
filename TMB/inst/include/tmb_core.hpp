@@ -390,6 +390,7 @@ public:
 	}
     }
     thetanames.resize(theta.size());
+    for(int i=0;i<thetanames.size();i++)thetanames[i]="";
     current_parallel_region=-1;
     selected_parallel_region=-1;
     max_parallel_regions=-1;
