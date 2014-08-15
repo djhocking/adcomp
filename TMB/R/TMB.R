@@ -1,3 +1,15 @@
+##' Internal TMB Functions
+##'
+##' Internal TMB functions
+##'
+##' These are not to be called by the user (or in some cases are just
+##' waiting for proper documentation to be written :).
+##'
+##' @name TMB-internal
+##' @aliases checkSparseHessian config dynlib flagsDefaults getUserDLL grepRandomParameters info isParallelTemplate newtonDefaults newtonOption parallelBenchmark plot.parallelBenchmark print.backtrace print.sdreport runSymbolicAnalysis setDefaults sparseHessianFun summary.sdreport tmbOption updateCholesky
+##' @rdname TMB-internal
+NULL
+
 ## Utilities
 grepRandomParameters <- function(parameters,random){
   r <- sort(unique(unlist(lapply(random,function(regexp)grep(regexp,names(parameters))))))
