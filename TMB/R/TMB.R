@@ -1132,7 +1132,6 @@ sparseHessianFun <- function(obj,skipFixedEffects=FALSE){
                      dumpstack=as.integer(0)),PACKAGE=obj$env$DLL)
   i=as.integer(attr(ADHess$ptr,"i"))
   j=as.integer(attr(ADHess$ptr,"j"))
-  require(Matrix)
   n <- length(obj$env$par)
   M <- new("dsTMatrix",i=i,j=j,x=ev(),Dim=as.integer(c(n,n)),uplo="L")
   Hfull <- as(M,"dsCMatrix")
@@ -1151,25 +1150,6 @@ sparseHessianFun <- function(obj,skipFixedEffects=FALSE){
       }
     }
   }
-}
-
-## ==== Least squares polynomial fit
-fitpoly <- function(x,y,dy,order=max.order,max.order=sum(is.finite(c(y,dy)))-1){
-  require(polynom)
-  i <- is.finite(y)
-  j <- is.finite(dy)
-  n <- 0:order
-  pow <- function(n,x)ifelse(n>=0,x^n,0)
-  A <- outer(n,x[i],pow)
-  DA <- n*outer(n-1,x[j],pow)
-  B <- if(sum(i)==0)DA else if(sum(j)==0)A else cbind(A,DA)
-  B <- t(B)
-  z <- c(y[i],dy[j])
-  ## B*c=z (overdetermined - use least squares)
-  ## c=solve((Bt)*B)*Bt*z
-  c <- try(solve(t(B)%*%B,t(B)%*%z),TRUE)
-  if(is.character(c))return(Recall(x,y,dy,order-1))
-  polynomial(c)
 }
 
 ## Debugging utility: Check sparse hessian.
