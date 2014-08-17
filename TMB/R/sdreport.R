@@ -113,7 +113,7 @@ sdreport <- function(obj,par.fixed=NULL,hessian.fixed=NULL,getJointPrecision=FAL
       w[r] <- tmp[,i]
       -f(par, order = 1, type = "ADGrad",rangeweight = w)[-r]
     }
-    A <- t(sapply(seq(length=length(phi)),reverse.sweep)) + Dphi.fixed
+    A <- t(do.call("cbind",lapply(seq(length=length(phi)),reverse.sweep))) + Dphi.fixed
     term2 <- A%*%(Vtheta%*%t(A)) ## second term
     cov <- term1 + term2
   }
