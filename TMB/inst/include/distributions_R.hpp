@@ -234,8 +234,8 @@ VECTORIZE3_tti(dt);
 template <class Type>
 Type dmultinom(vector<Type> x, vector<Type> p, int give_log=0)
 {
-        Type logres = lgamma(x.sum()+Type(1))-(lgamma( vector<Type>(x+Type(1))) ).sum()
-	  +(x*log(p)).sum();
-	if(give_log) return(logres);
-	else return( exp(logres) );
+	vector<Type> xp1 = x+Type(1);
+	Type logres = lgamma(x.sum() + Type(1)) - lgamma(xp1).sum() + (x*log(p)).sum();
+	if(give_log) return logres;
+	else return exp(logres);
 }
