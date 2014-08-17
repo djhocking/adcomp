@@ -45,7 +45,7 @@
 ##' summary(rep,"random")                    ## Only random effects
 ##' summary(rep,"fixed",p.value=TRUE)        ## Only fixed effects
 ##' summary(rep,"report")                    ## Only report
-sdreport <- function(obj,par.fixed=NULL,hessian.fixed=NULL,getJointPrecision=FALSE,bias.correct=FALSE){
+sdreport <- function(obj,par.fixed=NULL,hessian.fixed=NULL,getJointPrecision=FALSE,bias.correct=FALSE,importance.sample=FALSE){
   if(is.null(obj$env$ADGrad) & (!is.null(obj$env$random)))
     stop("Cannot calculate sd's without type ADGrad available in object for random effect models.")
   ## Make object to calculate ADREPORT vector
@@ -141,6 +141,16 @@ sdreport <- function(obj,par.fixed=NULL,hessian.fixed=NULL,getJointPrecision=FAL
       names(estimate) <- names(phi)
       Vestimate <- -hess[i,i] + hess[i,!i] %*% Vtheta %*% hess[!i,i]
       ans$unbiased <- list(value=estimate,sd=sqrt(diag(Vestimate)),cov=Vestimate)
+  }
+  ## ======== Calculate bias corrected random effects estimates by importance sampling
+  if(importance.sample){
+      phifun <- function(u){
+          par[obj$env$random] <- u
+          obj2$fn(par)
+      }
+      con <- obj$env$MCcontrol
+      estimate <- obj$env$MC(n=con$n,seed=con$seed,phi=phifun,par=par,par0=par) ## See previous definition of "par"
+      ans$unbiased.sample <- list(value=estimate)
   }
   ## ======== Find marginal variances of all random effects i.e. phi(u,theta)=u
   if(!is.null(r)){
