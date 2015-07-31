@@ -17,7 +17,17 @@ grepRandomParameters <- function(parameters,random){
   tmp[r] <- lapply(tmp[r],function(x)x*0+1)
   which(as.logical(unlist(tmp)))
 }
-getUserDLL <- function()names(tail(getLoadedDLLs(),1)) ## Assume users code is the final dyn.loaded library
+
+## Guess name of user's loaded DLL code
+getUserDLL <- function(){
+    dlls <- getLoadedDLLs()
+    isTMBdll <- function(dll)!is(try(getNativeSymbolInfo("MakeADFunObject",dll),TRUE),"try-error")
+    TMBdll <- sapply(dlls, isTMBdll)
+    if(sum(TMBdll) == 0) stop("There are no TMB models loaded (use 'dyn.load').")
+    if(sum(TMBdll) >1 ) stop("Multiple TMB models loaded. Failed to guess DLL name.")
+    names(dlls[TMBdll])
+}
+
 ## Update cholesky factorization ( of H+t*I ) avoiding copy overhead
 ## by writing directly to L(!).
 updateCholesky <- function(L,H,t=0){
@@ -92,13 +102,8 @@ updateCholesky <- function(L,H,t=0){
 ##' }
 ##'
 ##' A high level of tracing information will be output by default when evaluating the objective function and gradient.
-##' This is useful while developing a model, but may eventually become annoying.
-##' The following will disable all tracing from an object 'obj' returned by 'MakeADFun':
-##' \itemize{
-##' \item \code{obj$env$tracemgc <- FALSE}
-##' \item \code{obj$env$inner.control$trace <- FALSE}
-##' \item \code{obj$env$silent <- TRUE}
-##' }
+##' This is useful while developing a model, but may eventually become annoying. Disable all tracing by passing
+##' \code{silent=TRUE} to the \code{MakeADFun} call.
 ##' 
 ##' @title Construct objective functions with derivatives based on a compiled c++ template.
 ##' @param data List of data objects (vectors,matrices,arrays,factors,sparse matrices) required by the user template (Order does not matter and un-used components are allowed).
@@ -106,6 +111,8 @@ updateCholesky <- function(L,H,t=0){
 ##' @param map List defining how to optionally collect and fix parameters - see details.
 ##' @param type Character vector defining which operation stacks are generated from the users template - see details.
 ##' @param random Character vector defining the random effect parameters. See also \code{regexp}.
+##' @param profile Parameters to profile out of the likelihood (this subset will be appended to \code{random} with Laplace
+##' approximation disabled).
 ##' @param random.start Expression defining the strategy for choosing random effect initial values as function of previous function evaluations - see details.
 ##' @param hessian Calculate Hessian at optimum?
 ##' @param method Outer optimization method.
@@ -118,11 +125,13 @@ updateCholesky <- function(L,H,t=0){
 ##' @param DLL Name of shared object file compiled by user.
 ##' @param checkParameterOrder Optional check for correct parameter order.
 ##' @param regexp Match random effects by regular expressions?
+##' @param silent Disable all tracing information?
 ##' @param ... Currently unused.
 ##' @return List with components (fn,gr, etc) suitable for an optim call.
 MakeADFun <- function(data,parameters,map=list(),
                       type=c("ADFun","Fun","ADGrad"[!is.null(random)]),
                       random=NULL,
+                      profile=NULL,
                       random.start=expression(last.par.best[random]),
                       hessian=FALSE,method="BFGS",
                       inner.method="newton",
@@ -134,12 +143,13 @@ MakeADFun <- function(data,parameters,map=list(),
                       DLL=getUserDLL(),
                       checkParameterOrder=TRUE, ## Optional check
                       regexp=FALSE,
+                      silent=FALSE,
                       ...){
   env <- environment() ## This environment
   if(!is.list(data))
     stop("data must be a list")
   ok <- function(x)(is.matrix(x)|is.vector(x)|is.array(x))&is.numeric(x)
-  ok.data <- function(x)ok(x)|is.factor(x)|is(x,"sparseMatrix")
+  ok.data <- function(x)ok(x)|is.factor(x)|is(x,"sparseMatrix")|is.list(x)
   check.passed <- function(x){
     y <- attr(x,"check.passed")
     if(is.null(y)) FALSE else y
@@ -148,8 +158,8 @@ MakeADFun <- function(data,parameters,map=list(),
     if(!all(sapply(data,ok.data))){
       cat("Problem with these data entries:\n")
       print(which(!sapply(data,ok.data)))
-      stop("Only numeric matrices, vectors, arrays ",
-           "or factors ",
+      stop("Only numeric matrices, vectors, arrays, ",
+           "factors or lists ",
            "can be interfaced")
     }
   }
@@ -163,6 +173,7 @@ MakeADFun <- function(data,parameters,map=list(),
   }
   if(length(data)){
     dataSanitize <- function(x){
+      if(is.list(x)) return( lapply(x, dataSanitize) )
       if(is(x,"sparseMatrix")){
         x <- as(x,"dgTMatrix")
       } else {
@@ -193,12 +204,12 @@ MakeADFun <- function(data,parameters,map=list(),
     ## Order in which parameters were requested:
     parNameOrder <- .Call("getParameterOrder",data,parameters,new.env(),PACKAGE=DLL)
     if(!identical(names(parameters),parNameOrder)){
-      cat("Order of parameters:\n")
-      print(names(parameters))
-      cat("Not matching template order:\n")
-      print(parNameOrder)
+      if(!silent) cat("Order of parameters:\n")
+      if(!silent) print(names(parameters))
+      if(!silent) cat("Not matching template order:\n")
+      if(!silent) print(parNameOrder)
       parameters <- parameters[parNameOrder]
-      cat("Your parameter list has been re-ordered.\n(Disable this warning with checkParameterOrder=FALSE)\n")
+      if(!silent) cat("Your parameter list has been re-ordered.\n(Disable this warning with checkParameterOrder=FALSE)\n")
     }
   }
   
@@ -271,7 +282,22 @@ MakeADFun <- function(data,parameters,map=list(),
   ADFun <- NULL
   Fun <- NULL
   ADGrad <- NULL
-  reparam <- NULL
+  tracepar <- FALSE
+  validpar <- function(x)TRUE
+  tracemgc <- TRUE
+  ## Disable all tracing information
+  beSilent <- function(){
+      tracemgc <<- FALSE
+      inner.control$trace <<- FALSE
+      silent <<- TRUE
+      cf <- config(DLL=DLL)
+      i <- grep("^trace.",names(cf))
+      cf[i] <- 0
+      cf$DLL <- DLL
+      do.call(config, cf)
+      NULL
+  }
+  if(silent)beSilent()
 
   ## All external pointers are created in function "retape" and can be re-created
   ## by running retape() if e.g. the number of openmp threads is changed.
@@ -283,6 +309,9 @@ MakeADFun <- function(data,parameters,map=list(),
       ## Hack: unlist(parameters) only guarantied to be a permutation of the parameter vecter.
       .Call("EvalDoubleFunObject",Fun$ptr,unlist(parameters),control=list(order=as.integer(0)),PACKAGE=DLL)
     }
+    if(is.character(profile)){
+        random <<- c(random, profile)
+    }
     if(is.character(random)){
       if(!regexp){ ## Default: do exact match
         if(!all(random %in% names(parameters))){
@@ -293,7 +322,7 @@ MakeADFun <- function(data,parameters,map=list(),
         }
         if(any(duplicated(random))){
           cat("Duplicates in 'random' - will be removed\n")
-          random <- unique(random)
+          random <<- unique(random)
         }
         tmp <- lapply(parameters,function(x)x*0)
         tmp[random] <- lapply(tmp[random],function(x)x*0+1)
@@ -305,6 +334,17 @@ MakeADFun <- function(data,parameters,map=list(),
           cat("Selected random effects did not match any model parameters.\n")
           random <<- NULL
         }
+      }
+      if(is.character(profile)){
+          ## Convert 'profile' to a pointer into random (represented
+          ## as logical index vector):
+          tmp <- lapply(parameters,function(x)x*0)
+          tmp[profile] <- lapply(tmp[profile],function(x)x*0+1)
+          profile <<- match( which(as.logical(unlist(tmp))) , random )
+          if(any(duplicated(profile))) stop("Profile parameter vector not unique.")
+          tmp <- rep(0L, length(random))
+          tmp[profile] <- 1L
+          profile <<- tmp
       }
       par <<- unlist(parameters)
     }
@@ -329,6 +369,9 @@ MakeADFun <- function(data,parameters,map=list(),
   }
 
   retape()
+
+  ## Has atomic functions been generated for the tapes ?
+  usingAtomics <- function().Call("usingAtomics", PACKAGE=DLL)
   
   f <- function(theta=par,order=0,type=c("ADdouble","double","ADGrad"),
                 cols=NULL,rows=NULL,
@@ -395,6 +438,16 @@ MakeADFun <- function(data,parameters,map=list(),
       ## therefore tril takes long time. Further, "diag<-" is too slow.
       ## FIXED! :
       ihessian <- solveSubset2(L)
+      ## Profile case correction (1st order case only)
+      if(!is.null(profile)){
+          ## Naive way:
+          ##   ihessian[profile,] <- 0
+          ##   ihessian[,profile] <- 0
+          ## However, this would modify sparseness pattern and also not
+          ## account for 'ihessian' being permuted:
+          perm <- L@perm+1L
+          ihessian <- .Call("tmb_sparse_izamd", ihessian, profile[perm], 0.0, PACKAGE="TMB")
+      }
       
       ## General function to lookup entries A subset B.
       ## lookup.old <- function(A,B){
@@ -416,11 +469,11 @@ MakeADFun <- function(data,parameters,map=list(),
         ## hessian: Hessian of random effect part only.
         ## ihessian: Inverse subset of hessian (same dim but larger pattern!).
         ## Hfull: Pattern of full hessian including fixed effects.
-        cat("Matching hessian patterns... ")
+        if (!silent) cat("Matching hessian patterns... ")
         iperm <- Matrix::invPerm(L@perm+1L)
         e$ind1 <- lookup(hessian,ihessian,iperm) ## Same dimensions
         e$ind2 <- lookup(hessian,e$Hfull,random)  ## Note: dim(Hfull)>dim(hessian) !
-        cat("Done\n")
+        if (!silent) cat("Done\n")
       }
       w <- rep(0,length=length(e$Hfull@x))
       w[e$ind2] <- ihessian@x[e$ind1]
@@ -485,6 +538,16 @@ MakeADFun <- function(data,parameters,map=list(),
     } else {
       hessian <- spHess(par,random=TRUE)
     }
+    ## Profile case correction (0 and 1st order)
+    if( !is.null(profile) ){
+        ## Naive way:
+        ##   hessian[profile, ] <- 0
+        ##   hessian[, profile] <- 0
+        ##   diag(hessian)[profile] <- 1
+        ## However, this would modify sparseness pattern:
+        hessian <- .Call("tmb_sparse_izamd", hessian, profile, 1.0, PACKAGE="TMB")
+    }
+    ## Update Cholesky:
     if(inherits(env$L.created.by.newton,"dCHMsuper")){
       L <- env$L.created.by.newton
       ##.Call("destructive_CHM_update",L,hessian,as.double(0),PACKAGE="Matrix")
@@ -495,6 +558,10 @@ MakeADFun <- function(data,parameters,map=list(),
     
     if(order==0){
       res <- h(par,order=0,hessian=hessian,L=L)
+      ## Profile case correction
+      if(!is.null(profile)){
+          res <- res + sum(profile)/2*log(2*pi)
+      }
       if(is.finite(res)){
         if(res<value.best){
           last.par.best <<- par; value.best <<- res
@@ -507,6 +574,19 @@ MakeADFun <- function(data,parameters,map=list(),
       grad <- h(par,order=1,hessian=hessian,L=L)
       #res <- grad[-random] - t(grad[random])%*%solve(hess[random,random])%*%hess[random,-random]
       #res <- grad[-random] - t(grad[random])%*%solve(hess[random,])%*%t(hess[-random,])
+
+      ## Profile case correction. The remaining calculations must be
+      ## done with the original hessian (which has been destroyed)
+      if(!is.null(profile)){
+          ## Update hessian and Cholesky:
+          if(!skipFixedEffects){ ## old way
+              hess <- spHess(par) ## Full hessian
+              hessian <- hess[random,random] ## Subset
+          } else {
+              hessian <- spHess(par,random=TRUE)
+          }
+          updateCholesky(L,hessian)
+      }
       
       ## res <- grad[-random] -
       ##   hess[-random,random]%*%as.vector(solve(hess[random,random],grad[random]))
@@ -578,6 +658,7 @@ MakeADFun <- function(data,parameters,map=list(),
                  seed=NULL,          ## Random seed
                  antithetic=TRUE,    ## Reduce variance
                  keep=FALSE,         ## Keep samples and fct evals
+                 phi=NULL,           ## Function to calculate mean of
                  ...){
     if(is.numeric(seed))set.seed(seed)
     ## Clean up on exit
@@ -609,18 +690,28 @@ MakeADFun <- function(data,parameters,map=list(),
     log.density.propose <- logdmvnorm(samples)
     samples <- samples+par0[random]
     log.density.target <- -apply(samples,2,eval.target)
+    log.density.target[is.nan(log.density.target)] <- -Inf
     I <- log.density.target - log.density.propose
     M <- max(I)
     if(order>=1){
-      I1 <- apply(samples,2,eval.target,order=1)[-random,,drop=FALSE]
       vec <- exp(I-M)
       p <- vec/sum(vec)
+      i <- (p>0)
+      p <- p[i]
+      I1 <- apply(samples[,i,drop=FALSE],2,eval.target,order=1)[-random,,drop=FALSE]
       gr <- as.vector(I1 %*% p)
       if(order==1)return(gr)
       ## I1I1 <- t(apply(I1,1,function(x)x%*%t(x)))
       ## I2 <- t(apply(samples,1,function(x)eval.target(x,order=2)[-random,-random]))
       ## h <- colMeans(vec*(-I1I1+I2))/mean(vec)+as.vector(gr)%*%t(as.vector(gr))
       ## if(order==2)return(h)
+    }
+    if(!is.null(phi)){
+      phival <- apply(samples,2,phi)
+      if(is.null(dim(phival)))phival <- t(phival)
+      p <- exp(I-M); p <- p/sum(p)
+      ans <- phival %*% p
+      return(ans)
     }
     value <- -log(mean(exp(I-M)))-M
     ci <- 1.96*sd(exp(I-M))/sqrt(n)
@@ -637,10 +728,6 @@ MakeADFun <- function(data,parameters,map=list(),
     as.list(reportenv)
   }
 
-  silent <- FALSE
-  tracepar <- FALSE
-  validpar <- function(x)TRUE
-  tracemgc <- TRUE
   if(is.null(random)){  ## Output if pure fixed effect model
     return(list(par=par,
                 fn=function(x=last.par,...){
@@ -661,7 +748,14 @@ MakeADFun <- function(data,parameters,map=list(),
                   if(tracemgc)cat("outer mgc: ",max(abs(ans)),"\n")
                   ans
                 },
-                he=function(x=last.par)f(x,order=2),
+                he=function(x=last.par,atomic=usingAtomics()){
+                    ## If no atomics on tape we have all orders implemented:
+                    if(!atomic) return( f(x,order=2) )
+                    ## Otherwise, get Hessian as 1st order derivative of gradient:
+                    if(is.null(ADGrad))
+                        ADGrad <<- .Call("MakeADGradObject",data,parameters,reportenv,PACKAGE=DLL)
+                    f(x,type="ADGrad",order=1)
+                },
                 hessian=hessian,method=method,
                 retape=retape,env=env,
                 report=report,...))
@@ -692,6 +786,7 @@ MakeADFun <- function(data,parameters,map=list(),
                   ans
                 },
                 he=function(x=last.par[-random],...){
+                  stop("Hessian not yet implemented for models with random effects.")
                   if(MCcontrol$doMC){
                     ff(x,order=0)
                     MC(last.par,n=MCcontrol$n,seed=MCcontrol$seed,order=2)
@@ -1147,9 +1242,9 @@ newton <- function (par,fn,gr,he,
       tail10 <- tail(fn.history[1:i],10)
       improve10 <- tail10[1] - tail10[length(tail10)]  
       if(improve10<tol10){
-        cat("Not improving much - will try early exit...")
+        if(trace>=1)cat("Not improving much - will try early exit...")
         pd <- iterate(par,pd.check=TRUE)
-        cat("PD hess?:",pd,"\n")
+        if(trace>=1)cat("PD hess?:",pd,"\n")
         if(pd)break;
         fail <- fail+1
       }
@@ -1187,9 +1282,6 @@ sparseHessianFun <- function(obj,skipFixedEffects=FALSE){
                   skip, ## <-- Skip this index vector of parameters
                   PACKAGE=obj$env$DLL
                   )
-  if(!config(DLL=obj$env$DLL)$optimize.instantly){ ## If not already optimized (because twice optimize gives fault):
-    .Call("optimizeADFunObject",ADHess$ptr,PACKAGE=obj$env$DLL)
-  }
   ev <- function(par=obj$env$par).Call("EvalADFunObject", ADHess$ptr, par,
                    control = list(
                      order = as.integer(0),

@@ -2,6 +2,22 @@
 * \brief Interfaces to R and CppAD
 */
 
+/*
+  Call to external C++ code can potentially result in exeptions that
+  will crash R. However, we do not want R to crash on failed memory
+  allocations. Therefore:
+
+  * All interface functions (those called with .Call from R) must have
+    TMB_TRY wrapped around CppAD/Eigen code that allocates memory.
+
+  * Special attention must be payed to parallel code, as each thread
+    is responsible for catching its own exceptions.
+*/
+#define TMB_TRY try
+#define TMB_CATCH catch(std::bad_alloc& ba)
+#define TMB_ERROR_BAD_ALLOC error("Memory allocation fail in function '%s'\n", \
+				  __FUNCTION__)
+
 /* Memory manager:
    Count the number of external pointers alive.
    When total number is zero it is safe to dyn.unload
@@ -90,6 +106,31 @@ bool _openmp=true;
 bool _openmp=false;
 #endif
 
+/** \brief Call the optimize method of an ADFun object pointer. */
+template<class ADFunPointer>
+void optimizeTape(ADFunPointer pf){
+  if(!config.optimize.instantly){
+    /* Drop out */
+    return;
+  }
+  if (!config.optimize.parallel){
+#ifdef _OPENMP
+#pragma omp critical
+#endif
+    { /* Avoid multiple tape optimizations at the same time (to reduce memory) */
+      if(config.trace.optimize)std::cout << "Optimizing tape... ";
+      pf->optimize();
+      if(config.trace.optimize)std::cout << "Done\n";
+    }
+  }
+  else
+    { /* Allow multiple tape optimizations at the same time */
+      if(config.trace.optimize)std::cout << "Optimizing tape... ";
+      pf->optimize();
+      if(config.trace.optimize)std::cout << "Done\n";
+    }
+}
+
 /* Utility: Compile time test for Type=double */
 template<class Type>
 struct isDouble{
@@ -136,9 +177,18 @@ Rboolean isNumericScalar(SEXP x){
 #define PARAMETER_VECTOR(name) vector<Type> name(objective_function::fillShape(asVector<Type>(objective_function::getShape(#name,&isNumeric)),#name));
 /** \brief Get parameter scalar from R and declare it as Type */
 #define PARAMETER(name) Type name(objective_function::fillShape(asVector<Type>(objective_function::getShape(#name,&isNumericScalar)),#name)[0]);
-/** \brief Get data vector from R and declare it as vector<Type> */
-#define DATA_VECTOR(name) vector<Type> name(asVector<Type>(	\
-	getListElement(objective_function::data,#name,&isNumeric)));
+/** \brief Get data vector from R and declare it as vector<Type>
+    \note If name is found in the parameter list it will be read as a
+    parameter vector. */
+#define DATA_VECTOR(name)						\
+vector<Type> name;							\
+if (!isNull(getListElement(objective_function::parameters,#name))) {	\
+  name = objective_function::fillShape(asVector<Type>(			\
+         objective_function::getShape(#name,&isNumeric)),#name);	\
+} else {								\
+  name = asVector<Type>(getListElement(					\
+         objective_function::data,#name,&isNumeric));			\
+}
 /** \brief Get data matrix from R and declare it as matrix<Type> */
 #define DATA_MATRIX(name) matrix<Type> name(asMatrix<Type>(	\
 	getListElement(objective_function::data,#name,&isMatrix)));
@@ -182,9 +232,18 @@ Levels: d e f g h i j
  Important: \c ADREPORT(name) must not be used before \c name has been assigned a value*/
 #define ADREPORT(name) objective_function::reportvector.push(name,#name);
 #define PARALLEL_REGION if(this->parallel_region())
-/** \brief Get data array from R and declare it as array<Type> */
-#define DATA_ARRAY(name) tmbutils::array<Type> name(tmbutils::asArray<Type>(	\
-	getListElement(objective_function::data,#name,&isArray)));
+/** \brief Get data array from R and declare it as array<Type>
+    \note If name is found in the parameter list it will be read as a
+    parameter array. */
+#define DATA_ARRAY(name)						\
+tmbutils::array<Type> name;						\
+if (!isNull(getListElement(objective_function::parameters,#name))) {	\
+  name = objective_function::fillShape(tmbutils::asArray<Type>(		\
+         objective_function::getShape(#name,&isArray)),#name);		\
+} else {								\
+  name = tmbutils::asArray<Type>(getListElement(			\
+         objective_function::data,#name,&isArray));			\
+}
 /** \brief Get parameter array from R and declare it as array<Type> */
 #define PARAMETER_ARRAY(name) tmbutils::array<Type> name(objective_function::fillShape(tmbutils::asArray<Type>(objective_function::getShape(#name,&isArray)),#name));
 /** \brief Get data matrix from R and declare it as matrix<int> */
@@ -193,6 +252,77 @@ Levels: d e f g h i j
 /** \brief Get data array from R and declare it as array<int> */
 #define DATA_IARRAY(name) tmbutils::array<int> name(tmbutils::asArray<int>(	\
 	getListElement(objective_function::data,#name,&isArray)));
+/** \brief Get data list object from R and makes it available in C++
+
+Example (incomplete) of use:
+In R: 
+\verbatim
+data <- list()
+data$object <- list(a=1:10, b=matrix(1:6,2))
+obj <- MakeADFun(data,........) 
+\endverbatim
+
+In C++: 
+\verbatim
+// Corresponding list object on the C++ side
+template<class Type>
+struct my_list {
+  vector<Type> a;
+  matrix<Type> b;
+  my_list(SEXP x){ // Constructor
+    a = asVector<Type>(getListElement(x,"a"));
+    b = asMatrix<Type>(getListElement(x,"b"));
+  }
+};
+
+template<class Type>
+Type objective_function<Type>::operator() ()
+{
+  DATA_STRUCT(object, my_list);
+  REPORT(object.a); // Now you can use "a" and "b" as you like
+  REPORT(object.b);
+  return 0;
+}
+\endverbatim
+*/ 
+#define DATA_STRUCT(name, struct)struct<Type> name(getListElement(this->data,#name));
+
+/* Utilities for OSA residuals */
+template<class VT, class Type>
+struct data_indicator : VT{
+  VT cdf_lower, cdf_upper;
+  /* Construct from observation */
+  data_indicator(VT obs){
+    VT::operator=(obs); VT::fill(Type(1.0));
+    cdf_lower = obs; cdf_lower.setZero();
+    cdf_upper = obs; cdf_upper.setZero();
+  }
+  /* Fill with parameter vector */
+  void fill(vector<Type> p){
+    int n = (*this).size();
+    if(p.size() >= n  ) VT::operator=(p.segment(0, n));
+    if(p.size() >= 2*n) cdf_lower = p.segment(n, n);
+    if(p.size() >= 3*n) cdf_upper = p.segment(2 * n, n);
+  }
+};
+
+/** \brief Declare an indicator array 'name' of same shape as 'obs'.
+ */
+#define DATA_ARRAY_INDICATOR(name, obs)					\
+data_indicator<tmbutils::array<Type>, Type > name(obs);			\
+if (!isNull(getListElement(objective_function::parameters,#name))) {	\
+  name.fill( objective_function::fillShape(asVector<Type>(		\
+             objective_function::getShape(#name,&isNumeric)),#name) );	\
+}
+
+/** \brief Declare an indicator vector 'name' of same shape as 'obs'.
+ */
+#define DATA_VECTOR_INDICATOR(name, obs)				\
+data_indicator<tmbutils::vector<Type>, Type > name(obs);		\
+if (!isNull(getListElement(objective_function::parameters,#name))) {	\
+  name.fill( objective_function::fillShape(asVector<Type>(		\
+             objective_function::getShape(#name,&isNumeric)),#name) );	\
+}
 
 // kasper: Not sure used anywhere
 /** \brief Get the hessian sparsity pattern of ADFun object pointer */
@@ -290,7 +420,7 @@ struct report_stack{
     UNPROTECT(1);
     return nam;
   }
-  size_t size(){return result.size();}
+  EIGEN_DEFAULT_DENSE_INDEX_TYPE size(){return result.size();}
 };  // report_stack
 
 /** \brief Type definition of user-provided objective function (i.e. neg. log. like) */
@@ -390,6 +520,7 @@ public:
 	}
     }
     thetanames.resize(theta.size());
+    for(int i=0;i<thetanames.size();i++)thetanames[i]="";
     current_parallel_region=-1;
     selected_parallel_region=-1;
     max_parallel_regions=-1;
@@ -517,7 +648,26 @@ public:
     if(reversefill)theta[index++]=x;else x=theta[index++];
   }
    
-   Type operator() ();
+  Type operator() ();
+
+  Type evalUserTemplate(){
+    Type ans=this->operator()();
+    /* After evaluating the template, "index" should be equal to the length of "theta".
+       If not, we assume that the "epsilon method" has been requested from R, I.e.
+       that the un-used theta parameters are reserved for an inner product contribution
+       with the numbers reported via ADREPORT. */
+    if(index!=theta.size()){
+      if( index + reportvector.size() != theta.size() )
+	error("evalUserTemplate: Invalid parameter length.");
+      if( reportvector.size() > 0 ){
+	vector<Type> epsilon(reportvector.size());
+	this->fill(epsilon,"epsilon"); /* Assume theta has been sufficiently augmented */
+	ans += ( this->reportvector.result * epsilon ).sum();
+      }
+    }
+    return ans;
+  }
+
 }; // objective_function
 
 /* Experiment: Help manage the parallel accumulation.
@@ -648,7 +798,20 @@ SEXP EvalADFunObjectTemplate(SEXP f, SEXP theta, SEXP control)
       setAttrib(res,R_NamesSymbol,rangenames);
     }
   }
-  if(order==1)PROTECT(res=asSEXP(asMatrix(pf->Jacobian(x),m,n)));
+  if(order==1){
+    //PROTECT(res=asSEXP(asMatrix(pf->Jacobian(x),m,n)));
+    pf->Forward(0,x);
+    vector<double> jac(n*m);
+    vector<double> u(n);
+    vector<double> v(m);
+    for(int i=0;i<m;i++) v[i] = 0.0;
+    for(int i=0;i<m;i++){
+      v[i] = 1.0; u = pf->Reverse(1,v);
+      v[i] = 0.0;
+      for(int j=0;j<n;j++) jac[i*n+j] = u[j];
+    }
+    PROTECT(res=asSEXP(asMatrix(jac,m,n)));
+  }
   //if(order==2)res=asSEXP(pf->Hessian(x,0),1);
   if(order==2){
     if(ncols==0){
@@ -695,7 +858,7 @@ ADFun<double>* MakeADFunObject(SEXP data, SEXP parameters,
   ADFun< double >* pf;
   if(!returnReport){ // Default case: no ad report - parallel run allowed
     vector< AD<double> > y(1);
-    y[0]=F();
+    y[0]=F.evalUserTemplate();
     pf = new ADFun< double >(F.theta,y);
   } else { // ad report case
     F(); // Run through user template (modifies reportvector)
@@ -727,6 +890,7 @@ extern "C"
   SEXP MakeADFunObject(SEXP data, SEXP parameters,
 		       SEXP report, SEXP control)
   {
+    ADFun<double>* pf = NULL;
     /* Some type checking */
     if(!isNewList(data))error("'data' must be a list");
     if(!isNewList(parameters))error("'parameters' must be a list");
@@ -751,13 +915,23 @@ extern "C"
 
     if(_openmp && !returnReport){ // Parallel mode
 #ifdef _OPENMP
-      std::cout << n << " regions found.\n";
+      if(config.trace.parallel)
+	std::cout << n << " regions found.\n";
       start_parallel(); /* Start threads */
       vector< ADFun<double>* > pfvec(n);
+      bool bad_thread_alloc = false;
 #pragma omp parallel for if (config.tape.parallel)
       for(int i=0;i<n;i++){
-	pfvec[i]=MakeADFunObject(data, parameters, report, control, i, info);
-	if(config.optimize.instantly)pfvec[i]->optimize();
+	TMB_TRY {
+	  pfvec[i] = NULL;
+	  pfvec[i] = MakeADFunObject(data, parameters, report, control, i, info);
+	  if (config.optimize.instantly) pfvec[i]->optimize();
+	}
+	TMB_CATCH { bad_thread_alloc = true; }
+      }
+      if(bad_thread_alloc){
+	for(int i=0; i<n; i++) if (pfvec[i] != NULL) delete pfvec[i];
+	TMB_ERROR_BAD_ALLOC;
       }
       parallelADFun<double>* ppf=new parallelADFun<double>(pfvec);
       /* Convert parallel ADFun pointer to R_ExternalPtr */
@@ -765,9 +939,16 @@ extern "C"
       R_RegisterCFinalizer(res,finalizeparallelADFun);
 #endif
     } else { // Serial mode
-      /* Actual work: tape creation */
-      ADFun<double>* pf=MakeADFunObject(data, parameters, report, control, -1, info);
-      if(config.optimize.instantly)pf->optimize();
+      TMB_TRY{
+	/* Actual work: tape creation */
+	pf = NULL;
+	pf = MakeADFunObject(data, parameters, report, control, -1, info);
+	if (config.optimize.instantly) pf->optimize();
+      }
+      TMB_CATCH {
+	if (pf != NULL) delete pf;
+	TMB_ERROR_BAD_ALLOC;
+      }
       /* Convert ADFun pointer to R_ExternalPtr */
       PROTECT(res=R_MakeExternalPtr((void*) pf,mkChar("ADFun"),R_NilValue));
       setAttrib(res,install("range.names"),info);
@@ -827,13 +1008,18 @@ extern "C"
 
   SEXP EvalADFunObject(SEXP f, SEXP theta, SEXP control)
   {
-    if(isNull(f))error("Expected external pointer - got NULL");
-    SEXP tag=R_ExternalPtrTag(f);
-    if(!strcmp(CHAR(tag), "ADFun"))
-      return EvalADFunObjectTemplate<ADFun<double> >(f,theta,control);
-    if(!strcmp(CHAR(tag), "parallelADFun"))
-      return EvalADFunObjectTemplate<parallelADFun<double> >(f,theta,control);
-    error("NOT A KNOWN FUNCTION POINTER");
+    TMB_TRY {
+      if(isNull(f))error("Expected external pointer - got NULL");
+      SEXP tag=R_ExternalPtrTag(f);
+      if(!strcmp(CHAR(tag), "ADFun"))
+	return EvalADFunObjectTemplate<ADFun<double> >(f,theta,control);
+      if(!strcmp(CHAR(tag), "parallelADFun"))
+	return EvalADFunObjectTemplate<parallelADFun<double> >(f,theta,control);
+      error("NOT A KNOWN FUNCTION POINTER");
+    }
+    TMB_CATCH {
+      TMB_ERROR_BAD_ALLOC;
+    }
   }
   
 }
@@ -858,9 +1044,15 @@ extern "C"
     if(!isEnvironment(report))error("'report' must be an environment");
     
     /* Create DoubleFun pointer */
-    objective_function<double>* pF = 
-      new objective_function<double>(data,parameters,report);
-    
+    objective_function<double>* pF = NULL;
+    TMB_TRY {
+      pF = new objective_function<double>(data,parameters,report);
+    }
+    TMB_CATCH {
+      if (pF != NULL) delete pF;
+      TMB_ERROR_BAD_ALLOC;
+    }
+
     /* Convert DoubleFun pointer to R_ExternalPtr */
     SEXP res,ans;
     PROTECT(res=R_MakeExternalPtr((void*) pF,mkChar("DoubleFun"),R_NilValue));
@@ -873,25 +1065,28 @@ extern "C"
   
   SEXP EvalDoubleFunObject(SEXP f, SEXP theta, SEXP control)
   {
-    objective_function<double>* pf;
-    pf=(objective_function<double>*)R_ExternalPtrAddr(f);
-    PROTECT(theta=coerceVector(theta,REALSXP));
-    int n=pf->theta.size();
-    if(LENGTH(theta)!=n)error("Wrong parameter length.");
-
-    vector<double> x(n);
-    for(int i=0;i<n;i++)x[i]=REAL(theta)[i];
-    pf->theta=x;
-    
-    /* Since we are actually evaluating objective_function::operator() (not
-       an ADFun object) we should remember to initialize parameter-index. */
-    pf->index=0;
-    pf->parnames.resize(0); // To avoid mem leak.
-    pf->reportvector.clear();
-    SEXP res;
-    res=asSEXP(pf->operator()());
-    UNPROTECT(1);
-    return res;
+    TMB_TRY {
+      objective_function<double>* pf;
+      pf = (objective_function<double>*) R_ExternalPtrAddr(f);
+      PROTECT( theta=coerceVector(theta,REALSXP) );
+      int n = pf->theta.size();
+      if (LENGTH(theta)!=n) error("Wrong parameter length.");
+      vector<double> x(n);
+      for(int i=0;i<n;i++) x[i] = REAL(theta)[i];
+      pf->theta=x;
+      /* Since we are actually evaluating objective_function::operator() (not
+	 an ADFun object) we should remember to initialize parameter-index. */
+      pf->index=0;
+      pf->parnames.resize(0); // To avoid mem leak.
+      pf->reportvector.clear();
+      SEXP res;
+      res = asSEXP( pf->operator()() );
+      UNPROTECT(1);
+      return res;
+    }
+    TMB_CATCH {
+      TMB_ERROR_BAD_ALLOC;
+    }
   }
 
   /** \brief Gets parameter order by running the user template
@@ -899,15 +1094,18 @@ extern "C"
    We spend a function evaluation on getting the parameter order (!) */
   SEXP getParameterOrder(SEXP data, SEXP parameters, SEXP report)
   {
-    /* Some type checking */
-    if(!isNewList(data))error("'data' must be a list");
-    if(!isNewList(parameters))error("'parameters' must be a list");
-    if(!isEnvironment(report))error("'report' must be an environment");
-    objective_function<double> F(data,parameters,report);
-    //F.reversefill=true;
-    F(); // Run through user template
-    //return(F.defaultpar());
-    return F.parNames();
+    TMB_TRY {
+      /* Some type checking */
+      if(!isNewList(data))error("'data' must be a list");
+      if(!isNewList(parameters))error("'parameters' must be a list");
+      if(!isEnvironment(report))error("'report' must be an environment");
+      objective_function<double> F(data,parameters,report);
+      F(); // Run through user template
+      return F.parNames();
+    }
+    TMB_CATCH {
+      TMB_ERROR_BAD_ALLOC;
+    }
   }
 
 } /* Double interface */
@@ -921,7 +1119,7 @@ ADFun< double >* MakeADGradObject(SEXP data, SEXP parameters, SEXP report, int p
   int n=F.theta.size();
   Independent(F.theta);
   vector< AD<AD<double> > > y(1);
-  y[0]=F();
+  y[0]=F.evalUserTemplate();
   ADFun<AD<double> > tmp(F.theta,y);
   tmp.optimize(); /* Remove 'dead' operations (could result in nan derivatives) */
   vector<AD<double> > x(n);
@@ -939,6 +1137,7 @@ extern "C"
   /** \brief Tape the gradient using nested AD types */
   SEXP MakeADGradObject(SEXP data, SEXP parameters, SEXP report)
   {
+    ADFun<double>* pf = NULL;
     /* Some type checking */
     if(!isNewList(data))error("'data' must be a list");
     if(!isNewList(parameters))error("'parameters' must be a list");
@@ -956,13 +1155,23 @@ extern "C"
 
     if(_openmp){ // Parallel mode
 #ifdef _OPENMP
-      std::cout << n << " regions found.\n";
+      if(config.trace.parallel)
+	std::cout << n << " regions found.\n";
       start_parallel(); /* Start threads */
       vector< ADFun<double>* > pfvec(n);
+      bool bad_thread_alloc = false;
 #pragma omp parallel for if (config.tape.parallel)
       for(int i=0;i<n;i++){
-	pfvec[i]=MakeADGradObject(data, parameters, report, i);
-	if(config.optimize.instantly)pfvec[i]->optimize();
+	TMB_TRY {
+	  pfvec[i] = NULL;
+	  pfvec[i] = MakeADGradObject(data, parameters, report, i);
+	  if (config.optimize.instantly) pfvec[i]->optimize();
+	}
+	TMB_CATCH { bad_thread_alloc = true; }
+      }
+      if(bad_thread_alloc){
+	for(int i=0; i<n; i++) if (pfvec[i] != NULL) delete pfvec[i];
+	TMB_ERROR_BAD_ALLOC;
       }
       parallelADFun<double>* ppf=new parallelADFun<double>(pfvec);
       /* Convert parallel ADFun pointer to R_ExternalPtr */
@@ -971,8 +1180,15 @@ extern "C"
 #endif
     } else { // Serial mode
       /* Actual work: tape creation */
-      ADFun<double>* pf=MakeADGradObject(data, parameters, report, -1);
-      if(config.optimize.instantly)pf->optimize();
+      TMB_TRY {
+        pf = NULL;
+        pf = MakeADGradObject(data, parameters, report, -1);
+        if(config.optimize.instantly)pf->optimize();
+      }
+      TMB_CATCH {
+	if (pf != NULL) delete pf;
+	TMB_ERROR_BAD_ALLOC;
+      }
       /* Convert ADFun pointer to R_ExternalPtr */
       PROTECT(res=R_MakeExternalPtr((void*) pf,mkChar("ADFun"),R_NilValue));
       R_RegisterCFinalizer(res,finalizeADFun);
@@ -988,81 +1204,12 @@ extern "C"
 }
 
 
-/* ======================== EXPERIMENT: Tape sparse hessian */
-/* Status: Very effecient to evaluate (after optimize) however tape creation takes too long */
-extern "C"
-{
+/** \brief Tape the hessian[cbind(i,j)] using nested AD types.
 
-  /** \brief Tape the hessian[cbind(i,j)] using nested AD types */
-  SEXP MakeADHessObject(SEXP data, SEXP parameters, SEXP report, SEXP hessianrows, SEXP hessiancols)
-  {
-    /* Some type checking */
-    if(!isNewList(data))error("'data' must be a list");
-    if(!isNewList(parameters))error("'parameters' must be a list");
-    if(!isEnvironment(report))error("'report' must be an environment");
-    
-    /* TODO: Check i anf j*/
-    int ncols=length(hessiancols);
-    int nrows=length(hessianrows);
-    if(nrows!=ncols)error("hessianrows and hessiancols must have same length");
-    int m=ncols; /* Dimension of range vector */
-    vector<int> cols(ncols);    
-    vector<int> rows(nrows);
-    for(int i=0;i<ncols;i++){
-      cols[i]=INTEGER(hessiancols)[i]-1; //R-index -> C-index
-      rows[i]=INTEGER(hessianrows)[i]-1; //R-index -> C-index
-    }
-    
-    /* Create ADFun pointer */
-    objective_function< AD<AD<double> > > F(data,parameters,report);
-    int n=F.theta.size();
-    Independent(F.theta);
-    vector< AD<AD<double> > > y(1);
-    y[0]=F();
-    ADFun<AD<double> > tmp(F.theta,y);
-    
-    /* optimize it */
-    tmp.optimize();
-
-    vector<AD<double> > x(n);
-    for(int i=0;i<n;i++)x[i]=CppAD::Value(F.theta[i]);
-    vector<AD<double> > yy(m);
-    Independent(x);
-    //yy=tmp.Jacobian(x);
-    yy=tmp.ForTwo(x,rows,cols);
-    ADFun< double >* pf = new ADFun< double >(x,yy);
-    
-    /* Get the default parameter vector */
-    SEXP par;
-    PROTECT(par=F.defaultpar());
-
-    /* Convert ADFun pointer to R_ExternalPtr */
-    SEXP res;
-    PROTECT(res=R_MakeExternalPtr((void*) pf,mkChar("ADFun"),R_NilValue));
-    R_RegisterCFinalizer(res,finalizeADFun);
-
-    /* Return ptrList */
-    SEXP ans;
-    setAttrib(res,install("par"),par);
-    PROTECT(ans=ptrList(res));
-    UNPROTECT(3);
-    return ans;
-  } //MakeADHessObject
-
-
-
-}
-
-
-/* ======================== EXPERIMENT: 
-   Tape gradient on AD<AD<double>> and run optimize method. 
-   Then tape the sparse hessian as the gradient of each component.
- */
-  /** \brief Tape the hessian[cbind(i,j)] using nested AD types 
-
-     skip: integer vector of columns to skip from the hessian (will not change dimension
-            - only treat h[:,skip] and h[skip,:] as zero). Negative subscripts are not allowed.
-   */
+    skip: integer vector of columns to skip from the hessian (will not
+          change dimension - only treat h[:,skip] and h[skip,:] as
+          zero). Negative subscripts are not allowed.
+*/
 sphess MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP skip, int parallel_region=-1)
 {
   /* Some type checking */
@@ -1070,135 +1217,79 @@ sphess MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP skip, int
   if(!isNewList(parameters))error("'parameters' must be a list");
   if(!isEnvironment(report))error("'report' must be an environment");
   
-  int m;  
-  //int skip_=INTEGER(skip)[0];
-  //#define KEEP(i)(i<n-skip_)
-  //#define KEEP(i)(i>=skip_)
-  /* Keep lower triangle of hessian - and only random effect part */
-  //#define KEEP_COL(col)(col<n-skip_)
-  //#define KEEP_ROW(row,col)(KEEP_COL(row)&(row>=col))
-  /* Create ADFun pointer */
+  /* Prepare stuff */
   objective_function< AD<AD<AD<double> > > > F(data,parameters,report);
   F.set_parallel_region(parallel_region);
-  int n=F.theta.size();
-
+  int n = F.theta.size();
   vector<bool> keepcol(n); // Scatter for fast lookup 
-  for(int i=0;i<n;i++){keepcol[i]=true;}
-  for(int i=0;i<LENGTH(skip);i++){
+  for(int i=0; i<n; i++){
+    keepcol[i]=true;
+  }
+  for(int i=0; i<LENGTH(skip); i++){
     keepcol[INTEGER(skip)[i]-1]=false; // skip is R-index !
   }
-#define KEEP_COL(col)(keepcol[col])
-#define KEEP_ROW(row,col)(KEEP_COL(row)&(row>=col))
+#define KEEP_COL(col) (keepcol[col])
+#define KEEP_ROW(row,col) ( KEEP_COL(row) & (row>=col) )
 
+  /* Tape 1: Function R^n -> R */
   Independent(F.theta);
   vector< AD<AD<AD<double> > > > y(1);
-  y[0]=F();
-  ADFun<AD<AD<double> > > tmp(F.theta,y);
+  y[0] = F.evalUserTemplate();
+  ADFun<AD<AD<double> > > tape1(F.theta, y);
 
-  /* Tape gradient R^n -> R^n */
+  /* Tape 2: Gradient R^n -> R^n   (and optimize) */
   vector<AD<AD<double> > > xx(n);
-  for(int i=0;i<n;i++)xx[i]=CppAD::Value(F.theta[i]);
+  for(int i=0; i<n; i++) xx[i] = CppAD::Value(F.theta[i]);
   vector<AD<AD<double> > > yy(n);
   Independent(xx);
-  yy=tmp.Jacobian(xx);
-  ADFun<AD<double > > tmp2(xx,yy);
- 
-  /* Optimize tape */
-  tmp2.optimize();  // ================== WARNING!!!
-  
-  /* ========================================================== NOT DONE YET */
-  /* Tape hessian  */
-  tmp2.my_init(keepcol);
-  //std::cout << tmp2.colpattern << "\n";
-  m=0;
-  //for(int i=0;i<tmp2.colpattern.size();i++)m+=tmp2.colpattern[i].size();
+  yy = tape1.Jacobian(xx);
+  ADFun<AD<double > > tape2(xx,yy);
+  if (config.optimize.instantly) tape2.optimize();
+
+  /* Tape 3: Hessian  R^n -> R^m   (optimize later) */
+  tape2.my_init(keepcol);
   int colisize;
-  for(int i=0;i<int(tmp2.colpattern.size());i++){
-    colisize=tmp2.colpattern[i].size();
+  int m=0; // Count number of non-zeros (m)
+  for(int i=0; i<int(tape2.colpattern.size()); i++){
+    colisize = tape2.colpattern[i].size();
     if(KEEP_COL(i)){
-      for(int j=0;j<colisize;j++){
-	m+=KEEP_ROW( tmp2.colpattern[i][j] , i);
+      for(int j=0; j<colisize; j++){
+	m += KEEP_ROW( tape2.colpattern[i][j] , i);
       }
     }
   }
-    
-  // argument and result for reverse mode calculations
+  // Allocate index vectors of non-zero pairs
+  vector<int> rowindex(m);
+  vector<int> colindex(m);
+  // Prepare reverse sweep for Hessian columns
   vector<AD<double> > u(n);
   vector<AD<double> > v(n);
-    
-    
-  // initialize all the components
-  for(int i = 0; i < n; i++)
-    v[i] = 0.0;
-  
+  for(int i = 0; i < n; i++) v[i] = 0.0;
   vector<AD<double> > xxx(n);
-  for(int i=0;i<n;i++)xxx[i]=CppAD::Value(CppAD::Value(F.theta[i]));
+  for(int i=0; i<n; i++) xxx[i]=CppAD::Value(CppAD::Value(F.theta[i]));
   vector<AD<double> > yyy(m);
   CppAD::vector<int>* icol;
-  int k=0;
-  
+  // Do sweeps and fill in non-zero index pairs
   Independent(xxx);
-  // Take from Jacobian.hpp ...
-  // point at which we are evaluating the Jacobian
-  tmp2.Forward(0, xxx);
+  tape2.Forward(0, xxx);
+  int k=0;
   for(int i = 0; i < n; i++){
-    // TMB_PRINT(i);
-    /* ========== ORIGINAL
-       v[i] = 1.0;
-       u = tmp2.Reverse(1, v);
-       v[i] = 0.0;
-       yyy[i]=u[i]; // <--- Test: return the diagonal entry. 
-       ========== ORIGINAL */
-    if(KEEP_COL(i)){
-      tmp2.myReverse(1, v, i /*range comp*/, u /*domain*/);
-      icol=&tmp2.colpattern[i];
-      for(int j=0;j<int(icol->size());j++){
-	if(KEEP_ROW( icol->operator[](j), i ))yyy[k++]=u[icol->operator[](j)];
-      }
-    }
-    
-  }
-  
-  //yyy=tmp2.Jacobian(xxx);
-
-  //    ADFun< double >* pf = new ADFun< double >(xxx,yyy);
-  ADFun< double >* pf = new ADFun< double >;
-  pf->Dependent(xxx,yyy);
-
-  if(config.optimize.instantly){
-    if(config.trace.optimize)std::cout << "Optimizing tape... ";
-    pf->optimize();
-    if(config.trace.optimize)std::cout << "Done\n";
-  }
-  /* ========================================================= */    
-  
-  /* Calculate row and col index vectors.
-     The variable "k" now holds the number of non-zeros.
-  */
-
-  // colproj used to remap (i,j) pairs. Not used anymore.
-  vector<int> colproj(n); /* column projection index vector */
-  int cumsum=0;
-  for(int i = 0; i < n; i++){colproj[i]=cumsum;cumsum+=KEEP_COL(i);}
-  
-  vector<int> rowindex(k);
-  vector<int> colindex(k);
-  k=0;
-  for(int i = 0; i < n; i++){
-    if(KEEP_COL(i)){
-      icol=&tmp2.colpattern[i];
-      for(int j=0;j<int(icol->size());j++){
+    if (KEEP_COL(i)) {
+      tape2.myReverse(1, v, i /*range comp*/, u /*domain*/);
+      icol = &tape2.colpattern[i];
+      for(int j=0; j<int(icol->size()); j++){
 	if(KEEP_ROW( icol->operator[](j), i )){
-	  // rowindex[k]=colproj[icol->operator[](j)];
-	  // colindex[k]=colproj[i];
-	  rowindex[k]=icol->operator[](j);
-	  colindex[k]=i;
+	  rowindex[k] = icol->operator[](j);
+	  colindex[k] = i;
+	  yyy[k] = u[icol->operator[](j)];
 	  k++;
 	}
       }
     }
   }
-  sphess ans(pf,rowindex,colindex);
+  ADFun< double >* ptape3 = new ADFun< double >;
+  ptape3->Dependent(xxx,yyy);
+  sphess ans(ptape3, rowindex, colindex);
   return ans;
 } // MakeADHessObject2
 
@@ -1211,12 +1302,8 @@ SEXP asSEXP(const sphess_t<ADFunType> &H, const char* tag)
     par=R_NilValue;
     /* Convert ADFun pointer to R_ExternalPtr */
     SEXP res;
-    //PROTECT(res=R_MakeExternalPtr((void*) H.pf,mkChar("ADFun"),R_NilValue));
-    PROTECT(res=R_MakeExternalPtr((void*) H.pf,mkChar(tag),R_NilValue));
-
-    //R_RegisterCFinalizer(res,finalizeADFun);
-    R_RegisterCFinalizer(res,finalize<ADFunType>);
-
+    PROTECT( res = R_MakeExternalPtr((void*) H.pf, mkChar(tag), R_NilValue) );
+    R_RegisterCFinalizer(res, finalize<ADFunType>);
     /* Return list */
     SEXP ans;
     setAttrib(res,install("par"),par);
@@ -1232,38 +1319,67 @@ extern "C"
 {
 #ifdef _OPENMP
   SEXP MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP skip){
-
-    std::cout << "Count num parallel regions\n";
+    if(config.trace.parallel)
+      std::cout << "Count num parallel regions\n";
     objective_function< double > F(data,parameters,report);
     int n=F.count_parallel_regions();
-    std::cout << n << " regions found.\n";
+    if(config.trace.parallel)
+      std::cout << n << " regions found.\n";
 
     start_parallel(); /* Start threads */
 
     /* parallel test */
+    bool bad_thread_alloc = false;
     vector<sphess*> Hvec(n);
 #pragma omp parallel for if (config.tape.parallel)
-    //for(int i=0;i<n;i++)Hvec[i]=&MakeADHessObject2(data, parameters, report, skip, i);
-    for(int i=0;i<n;i++)Hvec[i]=new sphess(MakeADHessObject2(data, parameters, report, skip, i));
-
-    //parallelADFun<double> tmp(Hvec);
+    for (int i=0; i<n; i++) {
+      TMB_TRY {
+	Hvec[i] = NULL;
+	Hvec[i] = new sphess( MakeADHessObject2(data, parameters, report, skip, i) );
+	optimizeTape( Hvec[i]->pf );
+      }
+      TMB_CATCH { bad_thread_alloc = true; }
+    }
+    if (bad_thread_alloc) {
+      for(int i=0; i<n; i++) {
+	if (Hvec[i] != NULL) {
+	  delete Hvec[i]->pf;
+	  delete Hvec[i];
+	}
+      }
+      TMB_ERROR_BAD_ALLOC;
+    }
     parallelADFun<double>* tmp=new parallelADFun<double>(Hvec);
-
-    
     return asSEXP(tmp->convert(),"parallelADFun");
-
   } // MakeADHessObject2
 #else
   SEXP MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP skip){
-    //MakeADHessObject2_parallel(data, parameters, report, skip);
-    //sphess H=MakeADHessObject2(data, parameters, report, skip, 10000/* -1*/);
-    sphess H=MakeADHessObject2(data, parameters, report, skip, -1);
-    //TMB_PRINT(H.pf->Range());
-    /* Get the default parameter vector */
-    return asSEXP(H,"ADFun");
+    sphess* pH = NULL;
+    TMB_TRY {
+      pH = new sphess( MakeADHessObject2(data, parameters, report, skip, -1) );
+      optimizeTape( pH->pf );
+      return asSEXP(*pH, "ADFun");
+    }
+    TMB_CATCH {
+      if (pH != NULL) {
+	delete pH->pf;
+	delete pH;
+      }
+      TMB_ERROR_BAD_ALLOC;
+    }
   } // MakeADHessObject2
 #endif
-  
+}
+
+extern "C"
+{
+  SEXP usingAtomics(){
+    SEXP ans;
+    PROTECT(ans = allocVector(INTSXP,1));
+    INTEGER(ans)[0] = atomic::atomicFunctionGenerated;
+    UNPROTECT(1);
+    return ans;
+  }
 }
 
 #endif /* #ifndef WITH_LIBTMB */
@@ -1285,8 +1401,8 @@ extern "C"
   SEXP EvalDoubleFunObject(SEXP f, SEXP theta, SEXP control);
   SEXP getParameterOrder(SEXP data, SEXP parameters, SEXP report);
   SEXP MakeADGradObject(SEXP data, SEXP parameters, SEXP report);
-  SEXP MakeADHessObject(SEXP data, SEXP parameters, SEXP report, SEXP hessianrows, SEXP hessiancols);
   SEXP MakeADHessObject2(SEXP data, SEXP parameters, SEXP report, SEXP skip);
+  SEXP usingAtomics();
 }
 
 #endif /* #ifdef WITH_LIBTMB */

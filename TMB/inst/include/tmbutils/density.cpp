@@ -21,92 +21,55 @@ typedef array<scalartype> arraytype
 template <class scalartype_>
 class MVNORM_t{
   TYPEDEFS(scalartype_);
-  scalartype logdetQ;
-  /** Lower cholesky of _covariance_ */
-  matrixtype L; 
-  matrixtype Sigma; /* Keep for convenience - not used */
+  matrixtype Q;       /* Inverse covariance matrix */
+  scalartype logdetQ; /* log-determinant of Q */
+  matrixtype Sigma;   /* Keep for convenience - not used */
 public:
   MVNORM_t(){}
-  MVNORM_t(matrixtype Sigma_){
-    setSigma(Sigma_);
+  MVNORM_t(matrixtype Sigma_, bool use_atomic=true){
+    setSigma(Sigma_, use_atomic);
   }
 
   /** \brief Covariance extractor */
   matrixtype cov(){return Sigma;}
 
-  /* Lower triangular L: A=LL' */
-  matrixtype chol(const matrixtype &a){
-    int n=a.rows();
-    matrixtype l(n,n);
-    l.setZero();
-    scalartype tmp;
-    for(int i=0;i<n;i++)
-      for(int j=0;j<=i;j++){
-	tmp=a(i,j);
-	for(int k=0;k<j;k++)tmp-=l(i,k)*l(j,k);
-	if(i==j)l(i,j)=sqrt(tmp);
-	else l(i,j)=tmp/l(j,j);
-      }
-    return l;
-  }
-  /* Find x:=solve(L,y) */
-  vectortype lsolve(matrixtype &l, 
-		    vectortype y){
-    int n=l.rows();
-    vectortype x(n);
-    scalartype tmp;
-    for(int i=0;i<n;i++){
-      tmp=y(i);
-      for(int k=0;k<i;k++)tmp-=x(k)*l(i,k);
-      x(i)=tmp/l(i,i);
-    }
-    return x;
-  }
-  /* Find x:=solve(LL',y) - array case */
-  arraytype lltsolve(matrixtype &l, 
-		     arraytype y){
-    int n=l.rows();
-    arraytype x(y);
-    arraytype tmp(y.col(0).dim);
-    for(int i=0;i<n;i++){
-      tmp=y.col(i);
-      for(int k=0;k<i;k++)tmp=tmp-x.col(k)*l(i,k);
-      x.col(i)=tmp/l(i,i);
-    }
-    /* Find x:=solve(t(L),x) */
-    y=x;
-    for(int i=n-1;i>=0;i--){
-      tmp=y.col(i);
-      for(int k=n-1;k>i;k--)tmp=tmp-x.col(k)*l(k,i);
-      x.col(i)=tmp/l(i,i);
-    }
-    return x;
-  }
-
   /* initializer via covariance matrix */
-  void setSigma(matrixtype Sigma_){
-    Sigma=Sigma_;
-    L=chol(Sigma_);
-    logdetQ=scalartype(0);
-    for(int i=0;i<L.rows();i++)logdetQ -= scalartype(2)*log(L(i,i));
+  void setSigma(matrixtype Sigma_, bool use_atomic=true){
+    Sigma = Sigma_;
+    scalartype logdetS;
+    if(use_atomic){
+      Q = atomic::matinvpd(Sigma,logdetS);
+    } else {
+      matrixtype I(Sigma.rows(),Sigma.cols());
+      I.setIdentity();
+      Eigen::LDLT<Eigen::Matrix<scalartype,Dynamic,Dynamic> > ldlt(Sigma);
+      Q = ldlt.solve(I);
+      vectortype D = ldlt.vectorD();
+      logdetS = D.log().sum();
+    }
+    logdetQ = -logdetS;
   }
   scalartype Quadform(vectortype x){
-    vectortype u=lsolve(L,x);
-    return (u*u).sum();
+    return (x*(vectortype(Q*x))).sum();
   }
   /** \brief Evaluate the negative log density */
   scalartype operator()(vectortype x){
     return -scalartype(.5)*logdetQ + scalartype(.5)*Quadform(x) + x.size()*scalartype(log(sqrt(2.0*M_PI)));
   }
   arraytype jacobian(arraytype x){
-    return lltsolve(L,x);
+    arraytype y(x.dim);
+    matrixtype m(x.size()/x.cols(),x.cols());
+    for(int i=0;i<x.size();i++)m(i)=x[i];
+    matrixtype mQ=m*Q;
+    for(int i=0;i<x.size();i++)y[i]=mQ(i);
+    return y;
   }
   int ndim(){return 1;}
   VARIANCE_NOT_YET_IMPLEMENTED;
 };
 template <class scalartype>
-MVNORM_t<scalartype> MVNORM(matrix<scalartype> x){
-  return MVNORM_t<scalartype>(x);
+MVNORM_t<scalartype> MVNORM(matrix<scalartype> x, bool use_atomic=true){
+  return MVNORM_t<scalartype>(x, use_atomic);
 }
 
 /** \brief Multivariate normal distribution with unstructered correlation matrix
@@ -214,8 +177,8 @@ public:
     Let \f$f(x)\f$ denote a multivariate Gaussian mean-zero negative log density
     represented by its covariance matrix \f$\Sigma\f$. Define recursively the vectors
     \f[x_0\sim N(0,\Sigma)\f]
-    \f[x_1 = \phi x_0 + \varepsilon_1\:,\:\:\: \varepsilon_1 \sim N(0,\sigma\Sigma)\f]
-    \f[x_i = \phi x_{i-1} + \varepsilon_i\:,\:\:\: \varepsilon_i \sim N(0,\sigma\Sigma)\f]
+    \f[x_1 = \phi x_0 + \sigma\varepsilon_1\:,\:\:\: \varepsilon_1 \sim N(0,\Sigma)\f]
+    \f[x_i = \phi x_{i-1} + \sigma\varepsilon_i\:,\:\:\: \varepsilon_i \sim N(0,\Sigma)\f]
     where \f$\sigma=\sqrt{1-\phi^2}\f$. Then \f$E(x_i)=0\f$, \f$V(x_i)=\Sigma\f$ and the covariance
     is \f$E(x_ix_j')=\phi^{|i-j|}\Sigma\f$. We refer to this process as a stationary 1st order
     autoregressive process with multivariate increments with parameter phi and marginal distribution f.
@@ -340,6 +303,7 @@ class ARk_t{
   /* Initial distribution matrices. */
   matrixtype V0;    /* kxk variance  */
   matrixtype Q0;    /* kxk precision */
+  matrixtype L0;    /* kxk Cholesky Q0 = L0*L0' */
   /* gamma is found through (I-M)*gamma=phi ... */
   matrixtype M;     /* kxk   */
   matrixtype I;     /* kxk   */
@@ -380,9 +344,9 @@ public:
     /* build Q0 matrix */
     Q0=V0.inverse();
     /* log determinant */
-    matrixtype L=Q0.llt().matrixL(); /*L L' = Q*/
+    L0=Q0.llt().matrixL(); /* L0 L0' = Q0 */
     logdetQ0=scalartype(0);
-    for(int i=0;i<k;i++)logdetQ0+=scalartype(2)*log(L(i,i));
+    for(int i=0;i<k;i++)logdetQ0+=scalartype(2)*log(L0(i,i));
   }
   /** \brief Covariance extractor. 
       Run Youle-Walker recursions and return a vector of length n representing
@@ -404,12 +368,24 @@ public:
 
   /** \brief Evaluate the negative log density */
   scalartype operator()(vectortype x){
-    if(x.size()<k)std::cout << "AR(k) density requires vector length at least k\n";
     scalartype value=0;
-    for(int i=0;i<k;i++)
-      for(int j=0;j<k;j++)
-	value+=scalartype(.5)*x[i]*Q0(i,j)*x[j];
-    value-=scalartype(.5)*(logdetQ0- k*scalartype(log(2.0*M_PI)) );
+    /* Initial distribution. For i = k,...,1 the recursions for
+       solving L' y = u (1-based index notation) are:
+
+       y(i) = L(i,i)^-1 * ( u(i) - L(i+1,i) * y(i+1) - ... - L(k,i) * y(k) )
+
+       where u(i) ~ N(0,1).
+    */
+    scalartype mu, sd;
+    int col;
+    for(int i=0; (i<k) & (i<x.size()); i++){
+      mu = scalartype(0);
+      col = k-1-i; /* reversed index */
+      for(int j=col+1; j<k; j++) mu -= L0(j,col) * x(k-1-j);
+      mu /= L0(col, col);
+      sd = scalartype(1) / L0(col, col);
+      value -= dnorm(x[i], mu, sd, true);
+    }
     scalartype tmp;
     for(int i=k;i<x.size();i++){
       tmp=scalartype(0);
@@ -697,8 +673,8 @@ public:
 /** \brief Evaluate density of Gaussian Markov Random Field (GMRF) for sparse Q
 
   For detailed explanation of GMRFs see the class definition @ref GMRF_t
-  \param Q precission matrix
-  \param order Convolution order, i.e. the precission matrix is Q^order (matrix product)
+  \param Q precision matrix
+  \param order Convolution order, i.e. the precision matrix is Q^order (matrix product)
 
 */
 template <class scalartype>

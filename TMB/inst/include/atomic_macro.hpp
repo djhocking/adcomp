@@ -6,6 +6,10 @@
 #define CSKIP(x) x
 #endif
 
+/* Flag to detect if any atomic functions have been created */
+bool atomicFunctionGenerated = false;
+
+/** \brief Construct atomic vector function based on known derivatives */
 #define TMB_ATOMIC_VECTOR_FUNCTION(ATOMIC_NAME,OUTPUT_DIM,ATOMIC_DOUBLE,ATOMIC_REVERSE) \
 CppAD::vector<double> ATOMIC_NAME(CppAD::vector<double> tx)CSKIP({	\
   CppAD::vector<double> ty(OUTPUT_DIM);					\
@@ -18,7 +22,9 @@ template <class Type>							\
 class atomic##ATOMIC_NAME : public CppAD::atomic_base<Type> {		\
 public:									\
   atomic##ATOMIC_NAME(const char* name) : CppAD::atomic_base<Type>(name){ \
-    std::cout << "Constructing atomic " << #ATOMIC_NAME << "\n" ;	\
+    atomic::atomicFunctionGenerated = true;				\
+    if(config.trace.atomic)						\
+    	std::cout << "Constructing atomic " << #ATOMIC_NAME << "\n" ;	\
     this->option(CppAD::atomic_base<Type>::bool_sparsity_enum);		\
   }									\
 private:								\
@@ -33,8 +39,8 @@ private:								\
     if(q>0)error("Atomic '" #ATOMIC_NAME "' order not implemented.\n");	\
     if( vx.size() > 0 ){						\
       bool anyvx = false;						\
-      for(int i=0;i<vx.size();i++)anyvx |= vx[i];			\
-      for(int i=0;i<vy.size();i++)vy[i] = anyvx;			\
+      for(size_t i=0;i<vx.size();i++)anyvx |= vx[i];			\
+      for(size_t i=0;i<vy.size();i++)vy[i] = anyvx;			\
     }									\
     ty = ATOMIC_NAME(tx);	       					\
     return true;							\
@@ -55,7 +61,7 @@ private:								\
 			      CppAD::vector<bool>& st)			\
   {									\
     bool anyrt = false;							\
-    for(int i=0;i<rt.size();i++)anyrt |= rt[i];				\
+    for(size_t i=0;i<rt.size();i++)anyrt |= rt[i];			\
     for(size_t i=0;i<st.size();i++)st[i]=anyrt;				\
     return true;							\
   }									\
